@@ -448,12 +448,20 @@ class DockerContainerSensor(SensorEntity):
                         self._attr_extra_state_attributes[cond] = info.get(cond, None)
                     else:
                         self._attr_extra_state_attributes[cond] = stats.get(cond, None)
+                if info.get("image_version"):
+                    self._attr_extra_state_attributes["image_version"] = info.get("image_version")
             elif self.entity_description.key == CONTAINER_INFO_STATUS:
                 state = info.get(CONTAINER_INFO_STATUS)
                 self._state_extra = info.get(CONTAINER_INFO_STATE)
+            elif self.entity_description.key == CONTAINER_INFO_IMAGE:
+                state = info.get(self.entity_description.key)
+                img_ver = info.get("image_version")
+                self._attr_extra_state_attributes = {
+                    "version": img_ver,
+                    "image_version": img_ver,
+                }
             elif self.entity_description.key in [
                 CONTAINER_INFO_STATE,
-                CONTAINER_INFO_IMAGE,
                 CONTAINER_INFO_IMAGE_HASH,
                 CONTAINER_INFO_HEALTH,
             ]:

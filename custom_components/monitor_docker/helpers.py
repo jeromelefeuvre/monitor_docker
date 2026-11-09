@@ -4,6 +4,7 @@ import asyncio
 import concurrent
 import logging
 import os
+import re
 import ssl
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1069,6 +1070,12 @@ class DockerContainerAPI:
         self._info[CONTAINER_INFO_IMAGE] = raw["Config"]["Image"]
         self._info[CONTAINER_INFO_IMAGE_HASH] = raw["Image"]
 
+        # Extract semantic version from container labels, env vars, or image inspect
+        try:
+            self._info["image_version"] = await self._extract_image_version(raw)
+        except Exception as err:
+            _LOGGER.debug("[%s] %s: Error extracting version (%s)", self._instance, self._name, str(err))
+
         if self._network_error <= 5:
             if CONTAINER_INFO_NETWORK_AVAILABLE not in self._info:
                 self._info[CONTAINER_INFO_NETWORK_AVAILABLE] = (
@@ -1669,3 +1676,126 @@ class DockerContainerAPI:
         return "{} {}".format(
             delta.seconds, "second" if delta.seconds == 1 else "seconds"
         )
+
+    #############################################################
+    @staticmethod
+    def _is_valid_version(val: str) -> bool:
+        """Validate if a string is a real semantic / numeric version."""
+        if not val or not isinstance(val, str):
+            return False
+        v = val.strip()
+        # Exclude comparison operators, ranges, latest, etc.
+        if any(c in v for c in [">", "<", "=", "~", "^", "@", " ", "\n", "\t"]):
+            return False
+        if v.lower() in [
+            "latest",
+            "unknown",
+            "none",
+            "null",
+            "master",
+            "main",
+            "dev",
+            "nightly",
+            "stable",
+            "test",
+            "edge",
+            "beta",
+            "alpha",
+            "master-omnibus",
+        ]:
+            return False
+        # Must contain at least one digit
+        if not re.search(r"\d", v):
+            return False
+        # Must start with v or a digit
+        if not re.match(r"^v?\d", v, re.IGNORECASE):
+            return False
+        # Exclude commit hashes
+        if re.fullmatch(r"[0-9a-fA-F]{32,64}", v):
+            return False
+        return True
+
+    #############################################################
+    async def _extract_image_version(self, raw: dict) -> str | None:
+        """Extract a meaningful semantic version from container labels, env, or image inspect."""
+        labels = dict(raw.get("Config", {}).get("Labels") or {})
+        env_list = list(raw.get("Config", {}).get("Env") or [])
+
+        # If image ID available, try inspecting underlying image to merge base labels
+        if raw.get("Image"):
+            try:
+                img_info = await self._api.images.inspect(raw["Image"])
+                img_labels = img_info.get("Config", {}).get("Labels") or {}
+                if img_labels:
+                    labels = {**img_labels, **labels}
+                if not env_list:
+                    env_list = img_info.get("Config", {}).get("Env") or []
+            except Exception:
+                pass
+
+        # 1. Standard OCI and common version labels
+        priority_keys = [
+            "org.opencontainers.image.version",
+            "build_version",
+            "org.label-schema.version",
+            "version",
+            "app.version",
+            "software.version",
+            "image.version",
+        ]
+        for key in priority_keys:
+            val = labels.get(key)
+            if val and isinstance(val, str):
+                val = val.strip()
+                if "version:-" in val:
+                    parts = val.split("version:-")
+                    if len(parts) > 1:
+                        sub = parts[1].strip().split()[0]
+                        if self._is_valid_version(sub):
+                            return sub
+                elif self._is_valid_version(val):
+                    return val
+
+        # 2. Check any label containing "version" (excluding API/extension specs)
+        for k, v in labels.items():
+            k_lower = k.lower()
+            if "version" in k_lower and isinstance(v, str):
+                if any(bad in k_lower for bad in ["extension", "api", "desktop", "schema", "specification", "compose"]):
+                    continue
+                v_clean = v.strip()
+                if "version:-" in v_clean:
+                    parts = v_clean.split("version:-")
+                    if len(parts) > 1:
+                        sub = parts[1].strip().split()[0]
+                        if self._is_valid_version(sub):
+                            return sub
+                elif self._is_valid_version(v_clean) and len(v_clean) < 35:
+                    return v_clean
+
+        # 3. Environment variables
+        env_dict = {}
+        for item in env_list:
+            if isinstance(item, str) and "=" in item:
+                k, v = item.split("=", 1)
+                env_dict[k.strip()] = v.strip()
+
+        env_priority = ["APP_VERSION", "VERSION", "DOCKER_IMAGE_VERSION", "RELEASE"]
+        for k in env_priority:
+            val = env_dict.get(k)
+            if self._is_valid_version(val):
+                return val
+
+        for k, v in env_dict.items():
+            k_upper = k.upper()
+            if k_upper.endswith("_VERSION") and not k_upper.startswith("PYTHON") and not k_upper.startswith("NODE"):
+                if self._is_valid_version(v) and len(v) < 30:
+                    return v
+
+        # 4. Fallback to image tag if valid numeric version
+        image_name = raw.get("Config", {}).get("Image", "")
+        if ":" in image_name:
+            tag = image_name.split("@")[0].split(":")[-1]
+            if self._is_valid_version(tag):
+                return tag
+
+        return None
